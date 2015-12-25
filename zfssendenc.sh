@@ -49,5 +49,5 @@ zfs send $SNAP | \
 acdcli sync >/dev/null
 
 echo "Upload complete.  Created:"
-acdcli ls "$DEST" | grep "$DNAME"
+acdcli ls -l "$DEST" | grep "$DNAME"
 
