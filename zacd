@@ -1,0 +1,172 @@
+#!/bin/bash
+
+# set -x
+
+SUFFIX=".zfs.aes"
+ACDPATH=/zfs
+BASE=
+SNAP=
+DESTZFS=
+CHUNK=1000000000
+
+function usage() {
+	cat <<EOF
+Sending backups: 
+  $0 [--acdpath <path>] [--base <incr_snap>] [--chunk <bytes>] send <snap>
+
+  [-b|--base <incr_snap>] : Snap previously sent as a full backup will
+    be used as the basis of an incremental send.  The snap must be
+    present on the destination ACD and must remain on the source zpool
+    in order to be able to do future incrementals.  Restore will require
+    the basis snap as well as the series of all incrementals.  Always 
+    sends full backups if no base set.
+  
+  [-c|--chunk <bytes>] : Chunk size for pieces sent to ACD, in bytes.
+    Default: $CHUNK
+---
+Restoring backups: 
+  $0 [--acdpath <path>] receive <dest_zfs> <snap>
+  
+  <dest_zfs> : Full name of empty ZFS where snap(s) will be restored.
+    IE tank/mynewfs
+---
+Common Options:
+
+  [-a--acdpath <path>] : base path in ACD where snaps are stored
+                ^^^^  path is either a unix path starting with / 
+                      or an ACD node id in hex.
+    Default: $ACDPATH
+
+All snap names must be provided as full paths without leaving slash.  IE:
+  tank/myfs@snap-12345
+EOF
+}
+
+# urlencode <string>
+function urlencode() {
+  local length="${#1}"
+  for (( i = 0; i < length; i++ )); do
+    local c="${1:i:1}"
+    case $c in
+      [a-zA-Z0-9~_-]) printf "$c" ;;
+      *) printf '%%%02X' "'$c"
+    esac
+  done
+}
+
+# urldecode <string>
+function urldecode() {
+  local url_encoded="${1//+/ }"
+  printf '%b' "${url_encoded//%/\\x}"
+}
+
+while [[ $1 == -* ]] ; do
+  case "$1" in
+    -a | --acdpath)
+      ACDPATH="$2"
+      shift
+      shift
+      ;;
+    -b | --base)
+      BASE="$2"
+      shift
+      shift
+      ;;
+    -c | --chunk)
+      CHUNK="$2"
+      shift
+      shift
+      ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+MODE=
+
+case "$1" in
+  send)
+    MODE=SEND
+    SNAP="$2"
+    
+    if [ -z "$SNAP" ] || [ ! -z "$BASE" ] ; then
+      usage
+      exit 1
+    fi
+    ;;
+  receive | recv)
+    MODE=RECV
+    DESTZFS="$2"
+    SNAP="$3"
+    
+    if [ -z "$DESTZFS" ] || [ -z "$SNAP" ] ; then
+      usage
+      exit 1
+    fi
+    ;;
+  *)
+    usage
+    exit 1
+esac
+
+DNAME=`urlencode $SNAP`
+
+if [ "$MODE" = "SEND" ] ; then
+  # Send
+  
+  if ! zfs list -H "$SNAP" >/dev/null 2>&1 ; then
+  	echo "Snapshot $SNAP not found"
+  	exit 2
+  fi
+
+  acdcli sync >/dev/null || ( echo "Error accessing ACD" ; exit 99 )
+
+  if acdcli ls "$ACDPATH" | awk '{print $3}' | grep "$DNAME" >/dev/null 2>&1 ; then
+  	echo "ACD path $ACDPATH already contains snap files for $SNAP."
+  	echo "Manually delete the files or choose a different path (--acdroot)."
+  	echo
+  	acdcli ls "$ACDPATH" | grep "$DNAME"
+  	exit 3
+  fi
+
+  SIZE=`zfs list -t all -H -p | grep $SNAP | awk '{print $4}'`
+
+  echo "Encoding & sending $SIZE bytes from $SNAP..."
+  zfs send $SNAP | \
+  	openssl enc -e -z -aes-256-ctr | \
+  	split --additional-suffix=$SUFFIX --numeric-suffixes --bytes=$CHUNK \
+  	--filter="acdcli stream -o \$FILE ${ACDPATH}" \
+  	- ${DNAME}-	
+
+  acdcli sync >/dev/null || ( echo "Error accessing ACD" ; exit 99 )
+
+  echo "Upload complete.  Created:"
+  acdcli ls -l "$ACDPATH" | grep "$DNAME"
+  
+else
+  # Receive
+  if ! zfs list "$DESTZFS" >/dev/null 2>&1 ; then
+  	echo "Destination zfs $DESTZFS doesn't exist"
+  	exit 2
+  fi
+
+  acdcli sync >/dev/null || ( echo "Error accessing ACD" ; exit 99 )
+
+  COUNT=`acdcli ls ${ACDPATH} | grep -c "${DNAME}"`
+  SIZE=`acdcli ls -l -b ${ACDPATH} | grep "${DNAME}" | awk '{print $3}' | paste -sd+ - | bc`
+  PARTS=`acdcli ls ${ACDPATH} | grep "${DNAME}" | awk '{print $3}' | sort`
+
+  echo "Receiving & decoding $SIZE bytes in $COUNT chunks into $ACDPATH..."
+
+  { 
+  for p in $PARTS ; do
+  	acdcli cat ${ACDPATH}/$p
+  done
+  } | pv -s $SIZE | openssl enc -d -z -aes-256-ctr | zfs receive -v -d $DESTZFS
+
+  echo "Restore completed:"
+  zfs list -r $DESTZFS
+fi
+
